@@ -57,7 +57,7 @@ def load_manifest() -> dict:
 # ============================================================
 
 def run_subagent_with_provenance(task: str, source_url: str, document_name: str, context: str = "") -> list:
-    """Субагент який повертає структуровані знахідки з провенансом"""
+    """Субагент який повертає структуровані знахідки з провенансом та confidence score"""
     print(f"\n🤖 Субагент (з провенансом): {task[:50]}...")
 
     prompt = f"""You are a code reviewer. Analyze the provided information and return findings.
@@ -70,9 +70,15 @@ IMPORTANT: Return ONLY a JSON array. No other text. Format:
     "documentName": "{document_name}",
     "relevantExcerpt": "specific code or text that supports this finding",
     "publicationDate": "2026-05-03",
-    "severity": "CRITICAL, HIGH, or MEDIUM"
+    "severity": "CRITICAL, HIGH, or MEDIUM",
+    "confidence": 0.95
   }}
 ]
+
+confidence is a number from 0.0 to 1.0:
+- 0.9+ = you are very certain about this finding
+- 0.7-0.9 = fairly confident but some ambiguity
+- below 0.7 = uncertain, needs human review
 
 Task: {task}"""
 
@@ -102,6 +108,9 @@ Task: {task}"""
         print("⚠️ Не вдалось розпарсити провенанс")
         return []
 
+# ============================================================
+# ГОЛОВНИЙ КООРДИНАТОР
+# ============================================================
 
 def create_jira_ticket(session_id: str, summary: str, description: str, issue_type: str = "Task"):
     """Створюємо реальний тікет в Jira через MCP"""
@@ -131,10 +140,6 @@ def create_jira_ticket(session_id: str, summary: str, description: str, issue_ty
     else:
         print(f"❌ Помилка: {result.get('error', 'Unknown error')}")
         return None
-
-# ============================================================
-# ГОЛОВНИЙ КООРДИНАТОР
-# ============================================================
 
 def run_coordinator():
     print("\n🚀 Code Review Agent запущено!")
@@ -201,23 +206,37 @@ Find specific code quality issues with exact function names.""",
                  {"phase1_count": len(phase1_findings), "phase2_count": len(phase2_findings)},
                  ["phase3: create jira tickets"])
 
-    # --- ФАЗА 3: Створення Jira тікетів ---
-    print("\n📌 ФАЗА 3: Створення Jira тікетів")
+    # --- ФАЗА 3: Human Review + Створення Jira тікетів ---
+    print("\n📌 ФАЗА 3: Human Review + Створення Jira тікетів")
 
     all_findings = phase1_findings + phase2_findings
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
     all_findings.sort(key=lambda x: severity_order.get(x.get("severity", "MEDIUM"), 2))
 
-    print(f"\n🎯 Всього знахідок: {len(all_findings)}")
+    # Розділяємо по confidence score
+    AUTO_THRESHOLD = 0.85  # вище — автоматично в Jira
+    REVIEW_THRESHOLD = 0.70  # нижче — на перевірку людині
 
+    auto_findings = [f for f in all_findings if f.get("confidence", 0) >= AUTO_THRESHOLD]
+    review_findings = [f for f in all_findings if f.get("confidence", 0) < REVIEW_THRESHOLD]
+    ambiguous_findings = [f for f in all_findings if REVIEW_THRESHOLD <= f.get("confidence", 0) < AUTO_THRESHOLD]
+
+    print(f"\n📊 Human Review розподіл:")
+    print(f"   ✅ Автоматично в Jira (confidence >= {AUTO_THRESHOLD}): {len(auto_findings)}")
+    print(f"   ⚠️  Амбігуозні (потребують уваги): {len(ambiguous_findings)}")
+    print(f"   👤 На перевірку людині (confidence < {REVIEW_THRESHOLD}): {len(review_findings)}")
+
+    # Автоматично створюємо тікети для впевнених знахідок
+    print(f"\n🤖 Автоматично створюємо тікети...")
     created = []
-    for finding in all_findings[:5]:
+    for finding in auto_findings[:5]:
         description = f"""{finding['claim']}
 
 Source: {finding['sourceUrl']}
 File: {finding['documentName']}
 Evidence: {finding.get('relevantExcerpt', 'N/A')}
-Severity: {finding.get('severity', 'MEDIUM')}"""
+Severity: {finding.get('severity', 'MEDIUM')}
+Confidence: {finding.get('confidence', 'N/A')}"""
 
         result = create_jira_ticket(
             session_id=session_id,
@@ -228,13 +247,22 @@ Severity: {finding.get('severity', 'MEDIUM')}"""
         if result:
             created.append(finding['claim'][:60])
 
-    print(f"\n✅ Створено тікетів: {len(created)}")
-    for t in created:
-        print(f"   • {t}")
+    print(f"\n✅ Автоматично створено: {len(created)}")
 
-    write_scratchpad(f"\n## Фаза 3: Створено {len(created)} тікетів")
+    # Показуємо що потребує перевірки людини
+    if review_findings or ambiguous_findings:
+        print(f"\n👤 ПОТРЕБУЄ ВАШОЇ ПЕРЕВІРКИ:")
+        print("-" * 40)
+        for f in (ambiguous_findings + review_findings)[:5]:
+            confidence = f.get('confidence', 0)
+            print(f"  [{f.get('severity','?')}] confidence={confidence:.0%}")
+            print(f"  {f['claim'][:80]}")
+            print(f"  File: {f['documentName']}")
+            print()
+
+    write_scratchpad(f"\n## Фаза 3: Автоматично створено {len(created)} тікетів | На перевірку: {len(review_findings + ambiguous_findings)}")
     save_manifest(3, ["structure", "code_quality", "tickets"],
-                 {"created_tickets": len(created)},
+                 {"auto_created": len(created), "needs_review": len(review_findings)},
                  ["done"])
 
     print("\n" + "=" * 50)
